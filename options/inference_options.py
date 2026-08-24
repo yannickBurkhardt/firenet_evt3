@@ -1,7 +1,14 @@
 def set_inference_options(parser):
 
-    parser.add_argument('-o', '--output_folder', default=None, type=str)  # if None, will not write the images to disk
-    parser.add_argument('--dataset_name', default='reconstruction', type=str)
+    # the reconstructed images are written directly into this folder; if None, they are not saved to disk
+    parser.add_argument('-o', '--output_folder', default=None, type=str)
+
+    parser.add_argument('--image_name_format', default='timestamp_ns', type=str, choices=['index', 'timestamp_ns'],
+                        help="How to name the reconstructed images. 'timestamp_ns' (default): \
+                              <timestamp in nanoseconds>.png, zero padded to 19 digits, which is \
+                              the image folder format expected by Kalibr \
+                              (https://github.com/ethz-asl/kalibr/wiki/bag-format). \
+                              'index': frame_0000000000.png.")
 
     parser.add_argument('--use_gpu', dest='use_gpu', action='store_true')
     parser.set_defaults(use_gpu=True)

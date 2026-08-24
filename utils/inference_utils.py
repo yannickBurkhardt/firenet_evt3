@@ -72,7 +72,7 @@ class EventPreprocessor:
         self.hot_pixel_locations = []
         if options.hot_pixels_file:
             try:
-                self.hot_pixel_locations = np.loadtxt(options.hot_pixels_file, delimiter=',').astype(np.int)
+                self.hot_pixel_locations = np.loadtxt(options.hot_pixels_file, delimiter=',').astype(int)
                 print('Will remove {} hot pixels'.format(self.hot_pixel_locations.shape[0]))
             except IOError:
                 print('WARNING: could not load hot pixels file: {}'.format(options.hot_pixels_file))
@@ -154,45 +154,55 @@ class IntensityRescaler:
 
 class ImageWriter:
     """
-    Utility class to write images to disk.
+    Utility class to write the reconstructed images to disk, directly into the output folder.
     Also writes the image timestamps into a text file.
+
+    Event previews are never written to disk: --show_events only displays them.
     """
 
     def __init__(self, options):
 
         self.output_folder = options.output_folder
-        self.dataset_name = options.dataset_name
-        self.save_events = options.show_events
-        self.event_display_mode = options.event_display_mode
-        self.num_bins_to_show = options.num_bins_to_show
+        self.image_name_format = getattr(options, 'image_name_format', 'index')
         print('== Image Writer ==')
         if self.output_folder:
             ensure_dir(self.output_folder)
-            ensure_dir(join(self.output_folder, self.dataset_name))
-            print('Will write images to: {}'.format(join(self.output_folder, self.dataset_name)))
-            self.timestamps_file = open(join(self.output_folder, self.dataset_name, 'timestamps.txt'), 'a')
-
-            if self.save_events:
-                self.event_previews_folder = join(self.output_folder, self.dataset_name, 'events')
-                ensure_dir(self.event_previews_folder)
-                print('Will write event previews to: {}'.format(self.event_previews_folder))
+            print('Will write images to: {}'.format(self.output_folder))
+            if self.image_name_format == 'timestamp_ns':
+                print('Will name the images <timestamp in ns>.png (Kalibr image folder format)')
+            self.timestamps_file = open(join(self.output_folder, 'timestamps.txt'), 'a')
 
             atexit.register(self.__cleanup__)
         else:
             print('Will not write images to disk.')
 
-    def __call__(self, img, event_tensor_id, stamp=None, events=None):
+    def image_name(self, event_tensor_id, frame_stamp):
+        """
+        :param event_tensor_id: index of the event window the image was reconstructed from
+        :param frame_stamp: nominal timestamp of the image, in seconds
+        :return: file name of the image, without its directory
+        """
+        if self.image_name_format != 'timestamp_ns':
+            return 'frame_{:010d}.png'.format(event_tensor_id)
+
+        if frame_stamp is None:
+            raise ValueError("--image_name_format=timestamp_ns needs a timestamp for every image.")
+        stamp_ns = int(round(frame_stamp * 1e9))
+        if stamp_ns < 0:
+            raise ValueError('Cannot name an image after a negative timestamp ({} ns). '
+                             'Use --t_offset to shift the timestamps.'.format(stamp_ns))
+        # Kalibr reads the name as secs=name[:-9], nsecs=name[-9:], so it needs more than 9 digits:
+        # pad to 19 digits (the width of a nanosecond UNIX timestamp).
+        return '{:019d}.png'.format(stamp_ns)
+
+    def __call__(self, img, event_tensor_id, stamp=None, events=None, frame_stamp=None):
         if not self.output_folder:
             return
 
-        if self.save_events and events is not None:
-            event_preview = make_event_preview(events, mode=self.event_display_mode,
-                                               num_bins_to_show=self.num_bins_to_show)
-            cv2.imwrite(join(self.event_previews_folder,
-                             'events_{:010d}.png'.format(event_tensor_id)), event_preview)
+        if frame_stamp is None:
+            frame_stamp = stamp
 
-        cv2.imwrite(join(self.output_folder, self.dataset_name,
-                         'frame_{:010d}.png'.format(event_tensor_id)), img)
+        cv2.imwrite(join(self.output_folder, self.image_name(event_tensor_id, frame_stamp)), img)
         if stamp is not None:
             self.timestamps_file.write('{:.18f}\n'.format(stamp))
 
@@ -454,12 +464,12 @@ def events_to_voxel_grid(events, num_bins, width, height):
 
     events[:, 0] = (num_bins - 1) * (events[:, 0] - first_stamp) / deltaT
     ts = events[:, 0]
-    xs = events[:, 1].astype(np.int)
-    ys = events[:, 2].astype(np.int)
+    xs = events[:, 1].astype(int)
+    ys = events[:, 2].astype(int)
     pols = events[:, 3]
     pols[pols == 0] = -1  # polarity should be +1 / -1
 
-    tis = ts.astype(np.int)
+    tis = ts.astype(int)
     dts = ts - tis
     vals_left = pols * (1.0 - dts)
     vals_right = pols * dts

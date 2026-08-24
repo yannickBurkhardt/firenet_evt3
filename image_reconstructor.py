@@ -54,7 +54,7 @@ class ImageReconstructor:
         self.image_writer = ImageWriter(options)
         self.image_display = ImageDisplay(options)
 
-    def update_reconstruction(self, event_tensor, event_tensor_id, stamp=None):
+    def update_reconstruction(self, event_tensor, event_tensor_id, stamp=None, frame_stamp=None):
         with torch.no_grad():
 
             with CudaTimer('Reconstruction'):
@@ -106,5 +106,5 @@ class ImageReconstructor:
             # Post-processing, e.g bilateral filter (on CPU)
             out = self.image_filter(out)
 
-            self.image_writer(out, event_tensor_id, stamp, events=events)
+            self.image_writer(out, event_tensor_id, stamp, events=events, frame_stamp=frame_stamp)
             self.image_display(out, events)

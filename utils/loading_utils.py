@@ -4,7 +4,9 @@ from model.model import *
 
 def load_model(path_to_model):
     print('Loading model {}...'.format(path_to_model))
-    raw_model = torch.load(path_to_model)
+    # weights_only=False: the checkpoints store the model config alongside the weights
+    # (weights_only defaults to True as of PyTorch 2.6)
+    raw_model = torch.load(path_to_model, map_location='cpu', weights_only=False)
     arch = raw_model['arch']
 
     try:
