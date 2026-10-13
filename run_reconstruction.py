@@ -3,8 +3,8 @@ from utils.loading_utils import load_model, get_device
 import argparse
 from os.path import splitext
 import pandas as pd
-from utils.event_readers import make_event_reader, RAW_EXTENSIONS, absolute_window_index, \
-    window_duration_to_microseconds
+from utils.event_readers import make_event_reader, read_frame_timestamps, RAW_EXTENSIONS, \
+    FRAME_TIMESTAMP_UNITS_IN_NS, absolute_window_index, window_duration_to_microseconds
 from utils.evt3_utils import get_sensor_size_from_header, get_t_offset_from_header
 from utils.inference_utils import events_to_voxel_grid, events_to_voxel_grid_pytorch
 from utils.timers import Timer
@@ -26,6 +26,17 @@ if __name__ == "__main__":
                         help="Size of each event window, in number of events. Ignored if --fixed_duration=True")
     parser.add_argument('-T', '--window_duration', default=33.33, type=float,
                         help="Duration of each event window, in milliseconds. Ignored if --fixed_duration=False")
+    parser.add_argument('--timestamps_file', default=None, type=str,
+                        help="Path to a file holding the timestamps to reconstruct the frames at, \
+                              one per line, e.g. the capture times of another camera of the \
+                              platform. The events are then cut at those times -- the frame of \
+                              timestamp t[k] is built from the events of (t[k-1], t[k]] -- \
+                              instead of on the fixed grid of --fixed_duration / -N. The \
+                              timestamps must be on the time base of the events, i.e. absolute \
+                              for a recording whose header declares a time origin.")
+    parser.add_argument('--timestamps_unit', default='ns', type=str,
+                        choices=sorted(FRAME_TIMESTAMP_UNITS_IN_NS),
+                        help="Unit of the timestamps of --timestamps_file (default: ns).")
     parser.add_argument('--num_events_per_pixel', default=0.35, type=float,
                         help='in case N (window size) is not specified, it will be \
                               automatically computed as N = width * height * num_events_per_pixel')
@@ -58,6 +69,13 @@ if __name__ == "__main__":
                              dtype={'width': int, 'height': int},
                              nrows=1)
         sensor_size = tuple(header.values[0])
+
+    frame_timestamps_ns = None
+    if args.timestamps_file is not None:
+        if args.fixed_duration:
+            raise ValueError('--timestamps_file and --fixed_duration cut the events in two '
+                             'different ways, pass only one of them.')
+        frame_timestamps_ns = read_frame_timestamps(args.timestamps_file, args.timestamps_unit)
 
     if (args.width is None) != (args.height is None):
         raise ValueError('--width and --height must be specified together.')
@@ -99,7 +117,7 @@ if __name__ == "__main__":
 
     # Loop through the events and reconstruct images
     N = args.window_size
-    if not args.fixed_duration:
+    if not args.fixed_duration and frame_timestamps_ns is None:
         if N is None:
             N = int(width * height * args.num_events_per_pixel)
             print('Will use {} events per tensor (automatically estimated with num_events_per_pixel={:0.2f}).'.format(
@@ -126,7 +144,8 @@ if __name__ == "__main__":
                                               window_duration_ms=args.window_duration,
                                               num_events=N,
                                               start_index=start_index,
-                                              t_offset=t_offset)
+                                              t_offset=t_offset,
+                                              frame_timestamps_ns=frame_timestamps_ns)
 
     window_duration_us = window_duration_to_microseconds(args.window_duration) if args.fixed_duration else None
 
@@ -135,7 +154,13 @@ if __name__ == "__main__":
 
             last_timestamp = event_window[-1, 0]
 
-            if args.fixed_duration:
+            frame_stamp_ns = None
+            if frame_timestamps_ns is not None:
+                # the frame is meant for the timestamp the window was cut at, to the nanosecond:
+                # the seconds are only what the rest of the pipeline speaks in
+                frame_stamp_ns = event_window_iterator.frame_stamp_ns
+                frame_stamp = event_window_iterator.frame_stamp
+            elif args.fixed_duration:
                 # Nominal timestamp of the frame: the end of the absolute time window its events
                 # belong to. Unlike the timestamp of the last event, this is identical for two
                 # recordings cut on the same grid, which is what makes the frames of a stereo pair
@@ -161,6 +186,6 @@ if __name__ == "__main__":
 
             num_events_in_window = event_window.shape[0]
             reconstructor.update_reconstruction(event_tensor, start_index + num_events_in_window, last_timestamp,
-                                                frame_stamp=frame_stamp)
+                                                frame_stamp=frame_stamp, frame_stamp_ns=frame_stamp_ns)
 
             start_index += num_events_in_window

@@ -176,18 +176,22 @@ class ImageWriter:
         else:
             print('Will not write images to disk.')
 
-    def image_name(self, event_tensor_id, frame_stamp):
+    def image_name(self, event_tensor_id, frame_stamp, frame_stamp_ns=None):
         """
         :param event_tensor_id: index of the event window the image was reconstructed from
         :param frame_stamp: nominal timestamp of the image, in seconds
+        :param frame_stamp_ns: the same timestamp in whole nanoseconds, when it is known exactly.
+                               An absolute timestamp is 19 digits long, which a float does not
+                               hold, so the name would otherwise be off by a few hundred
+                               nanoseconds from the timestamp the frame was asked for.
         :return: file name of the image, without its directory
         """
         if self.image_name_format != 'timestamp_ns':
             return 'frame_{:010d}.png'.format(event_tensor_id)
 
-        if frame_stamp is None:
+        if frame_stamp_ns is None and frame_stamp is None:
             raise ValueError("--image_name_format=timestamp_ns needs a timestamp for every image.")
-        stamp_ns = int(round(frame_stamp * 1e9))
+        stamp_ns = int(frame_stamp_ns) if frame_stamp_ns is not None else int(round(frame_stamp * 1e9))
         if stamp_ns < 0:
             raise ValueError('Cannot name an image after a negative timestamp ({} ns). '
                              'Use --t_offset to shift the timestamps.'.format(stamp_ns))
@@ -195,14 +199,16 @@ class ImageWriter:
         # pad to 19 digits (the width of a nanosecond UNIX timestamp).
         return '{:019d}.png'.format(stamp_ns)
 
-    def __call__(self, img, event_tensor_id, stamp=None, events=None, frame_stamp=None):
+    def __call__(self, img, event_tensor_id, stamp=None, events=None, frame_stamp=None,
+                 frame_stamp_ns=None):
         if not self.output_folder:
             return
 
         if frame_stamp is None:
             frame_stamp = stamp
 
-        cv2.imwrite(join(self.output_folder, self.image_name(event_tensor_id, frame_stamp)), img)
+        cv2.imwrite(join(self.output_folder,
+                         self.image_name(event_tensor_id, frame_stamp, frame_stamp_ns)), img)
         if stamp is not None:
             self.timestamps_file.write('{:.18f}\n'.format(stamp))
 

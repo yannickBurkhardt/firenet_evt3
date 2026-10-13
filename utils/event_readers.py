@@ -1,5 +1,6 @@
 import pandas as pd
 import zipfile
+from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from os.path import splitext
 import numpy as np
 from .timers import Timer
@@ -8,6 +9,9 @@ from .evt3_utils import get_evt_version_from_header
 
 TXT_EXTENSIONS = ['.txt', '.zip']
 RAW_EXTENSIONS = ['.raw']
+
+# units a file of frame timestamps can be written in, in nanoseconds
+FRAME_TIMESTAMP_UNITS_IN_NS = {'ns': 1, 'us': 1000, 's': 1000000000}
 
 
 def window_duration_to_microseconds(duration_ms):
@@ -34,6 +38,104 @@ def absolute_window_indices(timestamps_s, window_duration_us):
     were rounded on the way to floating point.
     """
     return np.rint(timestamps_s * 1e6).astype(np.int64) // window_duration_us
+
+
+def read_frame_timestamps(path, unit='ns'):
+    """
+    Reads a file of frame timestamps, one per line, in the given unit: the times the frames are to
+    be reconstructed at, e.g. the capture times of the images of another camera of the platform.
+
+    They are kept as integer nanoseconds rather than as the seconds the rest of the pipeline works
+    in, because an absolute timestamp is 19 digits long and no float holds that exactly, while the
+    whole point of reconstructing at these times is that the frames land on them.
+
+    :return: the timestamps as a strictly increasing int64 array [ns].
+    """
+    if unit not in FRAME_TIMESTAMP_UNITS_IN_NS:
+        raise ValueError('Unknown timestamp unit: {} (expected one of: {})'.format(
+            unit, ', '.join(sorted(FRAME_TIMESTAMP_UNITS_IN_NS))))
+    factor = Decimal(FRAME_TIMESTAMP_UNITS_IN_NS[unit])
+
+    timestamps = []
+    with open(path, 'r') as timestamp_file:
+        for line_number, line in enumerate(timestamp_file, start=1):
+            line = line.split('#', 1)[0].strip().rstrip(',')
+            if not line:
+                continue
+            try:
+                timestamps.append(int((Decimal(line) * factor).to_integral_value(ROUND_HALF_EVEN)))
+            except (InvalidOperation, ValueError):
+                raise ValueError('{}, line {}: not a timestamp: {}'.format(path, line_number, line))
+
+    if not timestamps:
+        raise ValueError('{} holds no timestamp'.format(path))
+
+    timestamps = np.array(timestamps, dtype=np.int64)
+    # a timestamp that does not lie after the one before it would ask for a frame covering no
+    # events at all, so it is dropped rather than reconstructed empty
+    increasing = np.concatenate(([True], np.diff(timestamps) > 0))
+    if not increasing.all():
+        print('!!Warning!! {} of the {} timestamps of {} do not lie after the one before them, '
+              'they are skipped.'.format((~increasing).sum(), timestamps.size, path))
+        timestamps = timestamps[increasing]
+
+    return timestamps
+
+
+def event_timestamps_ns(timestamps_s):
+    """
+    The timestamps of decoded events as integer nanoseconds. Events are stamped in whole
+    microseconds by the sensor, so the float64 seconds they are carried in are rounded back to
+    that grid first (see absolute_window_indices).
+    """
+    return np.rint(timestamps_s * 1e6).astype(np.int64) * 1000
+
+
+class FrameWindows:
+    """
+    The event windows a file of frame timestamps asks for: window k holds the events of
+    (t[k-1], t[k]], so that the frame reconstructed from it is the state of the scene at t[k].
+
+    The first window covers one frame period before the first timestamp, i.e. (t[0] - (t[1] -
+    t[0]), t[0]]; the events before that are not part of any frame and are dropped. A window that
+    holds no event at all yields no frame, as an empty window does with the other readers.
+    """
+
+    def __init__(self, timestamps_ns):
+        self.timestamps_ns = timestamps_ns
+        self.next_frame = 0
+        self.num_empty_windows = 0
+        # lower bound of the first window; without a second timestamp to give a frame period,
+        # everything recorded before the first timestamp belongs to the first frame
+        if timestamps_ns.size > 1:
+            self.window_start_ns = int(2 * timestamps_ns[0] - timestamps_ns[1])
+        else:
+            self.window_start_ns = None
+
+        print('Will cut the events at the {} timestamps of the frame timestamp file'.format(
+            timestamps_ns.size))
+        if timestamps_ns.size > 1:
+            duration_s = (timestamps_ns[-1] - timestamps_ns[0]) / 1e9
+            print('Output frame rate: {:.1f} Hz on average'.format(
+                (timestamps_ns.size - 1) / duration_s if duration_s > 0 else float('inf')))
+
+    def exhausted(self):
+        return self.next_frame >= self.timestamps_ns.size
+
+    def current_end_ns(self):
+        return int(self.timestamps_ns[self.next_frame])
+
+    def advance(self):
+        """Moves on to the next frame, and returns the timestamp [ns] of the one just finished."""
+        finished = self.current_end_ns()
+        self.window_start_ns = finished
+        self.next_frame += 1
+        return finished
+
+    def report_empty_windows(self):
+        if self.num_empty_windows:
+            print('!!Warning!! {} of the {} timestamps got no event at all, no frame was written '
+                  'for them.'.format(self.num_empty_windows, self.timestamps_ns.size))
 
 
 class FixedSizeEventReader:
@@ -134,6 +236,86 @@ class FixedDurationEventReader:
                 self.event_list = []
                 return event_window
 
+        raise StopIteration
+
+
+class TimestampedEventReader:
+    """
+    Reads events from a '.txt' or '.zip' file, and cuts them at the timestamps of a frame
+    timestamp file: one event window per timestamp, holding the events of (t[k-1], t[k]]
+    (see FrameWindows).
+    """
+
+    def __init__(self, path_to_event_file, frame_timestamps_ns, start_index=0, t_offset=0.0):
+        file_extension = splitext(path_to_event_file)[1]
+        assert(file_extension in TXT_EXTENSIONS)
+        self.is_zip_file = (file_extension == '.zip')
+
+        if self.is_zip_file:  # '.zip'
+            self.zip_file = zipfile.ZipFile(path_to_event_file)
+            files_in_archive = self.zip_file.namelist()
+            assert(len(files_in_archive) == 1)  # make sure there is only one text file in the archive
+            self.event_file = self.zip_file.open(files_in_archive[0], 'r')
+        else:
+            self.event_file = open(path_to_event_file, 'r')
+
+        # ignore header + the first start_index lines
+        for i in range(1 + start_index):
+            self.event_file.readline()
+
+        self.t_offset = t_offset
+        self.windows = FrameWindows(frame_timestamps_ns)
+        self.frame_stamp_ns = None      # timestamp of the frame the last window is meant for
+        self.frame_stamp = None         # the same timestamp in seconds
+        self.event_list = []
+        self.pending_event = None       # the event that ended the window, kept for the next one
+        self.reached_end_of_file = False
+
+    def __iter__(self):
+        return self
+
+    def __del__(self):
+        if self.is_zip_file:
+            self.zip_file.close()
+
+        self.event_file.close()
+
+    def __next__(self):
+        with Timer('Reading event window from file'):
+            while not self.windows.exhausted():
+                end_ns = self.windows.current_end_ns()
+                start_ns = self.windows.window_start_ns
+
+                if self.pending_event is not None and self.pending_event[1] <= end_ns:
+                    self.event_list.append(self.pending_event[0])
+                    self.pending_event = None
+
+                if self.pending_event is None and not self.reached_end_of_file:
+                    self.reached_end_of_file = True
+                    for line in self.event_file:
+                        if self.is_zip_file:
+                            line = line.decode("utf-8")
+                        t, x, y, pol = line.split(' ')
+                        t, x, y, pol = float(t) + self.t_offset, int(x), int(y), int(pol)
+                        timestamp_ns = int(round(t * 1e6)) * 1000
+                        if timestamp_ns > end_ns:  # the first event of a later window
+                            self.pending_event = ([t, x, y, pol], timestamp_ns)
+                            self.reached_end_of_file = False
+                            break
+                        if start_ns is None or timestamp_ns > start_ns:
+                            self.event_list.append([t, x, y, pol])
+
+                event_window = np.array(self.event_list) if self.event_list else None
+                self.event_list = []
+                self.frame_stamp_ns = self.windows.advance()
+                self.frame_stamp = self.frame_stamp_ns / 1e9
+
+                if event_window is None:
+                    self.windows.num_empty_windows += 1
+                    continue
+                return event_window
+
+        self.windows.report_empty_windows()
         raise StopIteration
 
 
@@ -283,25 +465,104 @@ class FixedDurationEvt3EventReader:
                                                                   chunk_window_indices), axis=0)
 
 
+class TimestampedEvt3EventReader:
+    """
+    Reads events from a Prophesee EVT3 '.raw' file, and cuts them at the timestamps of a frame
+    timestamp file: one event window per timestamp, holding the events of (t[k-1], t[k]]
+    (see FrameWindows).
+
+    This is what puts the reconstructed frames on the clock of another camera: with a '.raw' that
+    was put on the time base of the platform, and the capture times of that camera as timestamps,
+    every frame is the state of the scene at the instant the other camera took its image.
+    """
+
+    def __init__(self, path_to_event_file, frame_timestamps_ns, start_index=0, t_offset=0.0):
+        self.windows = FrameWindows(frame_timestamps_ns)
+        self.buffer = Evt3EventBuffer(path_to_event_file, start_index=start_index, t_offset=t_offset)
+        self.frame_stamp_ns = None      # timestamp of the frame the last window is meant for
+        self.frame_stamp = None         # the same timestamp in seconds
+        self.pending_events = None
+        # timestamps of the pending events, in whole nanoseconds; kept alongside the events so
+        # that the windows are cut on integers rather than on the floats the events carry
+        self.pending_ns = None
+        self.reached_end_of_file = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        with Timer('Reading event window from file'):
+            while not self.windows.exhausted():
+                end_ns = self.windows.current_end_ns()
+
+                # the window is only complete once an event beyond it has been read, or once
+                # there is nothing left to read
+                while not self.reached_end_of_file and (self.pending_ns is None
+                                                        or self.pending_ns.size == 0
+                                                        or self.pending_ns[-1] <= end_ns):
+                    chunk = self.buffer.next_chunk()
+                    if chunk is None:
+                        self.reached_end_of_file = True
+                        break
+                    chunk_ns = event_timestamps_ns(chunk[:, 0])
+                    if self.pending_events is None or self.pending_events.shape[0] == 0:
+                        self.pending_events, self.pending_ns = chunk, chunk_ns
+                    else:
+                        self.pending_events = np.concatenate((self.pending_events, chunk), axis=0)
+                        self.pending_ns = np.concatenate((self.pending_ns, chunk_ns), axis=0)
+
+                event_window = None
+                if self.pending_ns is not None and self.pending_ns.size > 0:
+                    start_ns = self.windows.window_start_ns
+                    first = 0 if start_ns is None else int(np.searchsorted(self.pending_ns,
+                                                                           start_ns, side='right'))
+                    last = int(np.searchsorted(self.pending_ns, end_ns, side='right'))
+                    if last > first:
+                        event_window = self.pending_events[first:last]
+                    self.pending_events = self.pending_events[last:]
+                    self.pending_ns = self.pending_ns[last:]
+
+                self.frame_stamp_ns = self.windows.advance()
+                self.frame_stamp = self.frame_stamp_ns / 1e9
+
+                if event_window is None:
+                    self.windows.num_empty_windows += 1
+                    continue
+                return event_window
+
+        self.windows.report_empty_windows()
+        raise StopIteration
+
+
 def make_event_reader(path_to_event_file, fixed_duration, window_duration_ms=33.33, num_events=10000,
-                      start_index=0, t_offset=0.0):
+                      start_index=0, t_offset=0.0, frame_timestamps_ns=None):
     """
     Instantiate the event reader matching the format of 'path_to_event_file'
     ('.raw' for Prophesee EVT3 files, '.txt' / '.zip' for text files).
+
+    'frame_timestamps_ns' cuts the events at the given frame timestamps (see read_frame_timestamps)
+    instead of on a window grid, and takes precedence over 'fixed_duration'.
     """
     file_extension = splitext(path_to_event_file)[1].lower()
 
     if file_extension in RAW_EXTENSIONS:
-        reader_type = FixedDurationEvt3EventReader if fixed_duration else FixedSizeEvt3EventReader
+        is_raw_file = True
     elif file_extension in TXT_EXTENSIONS:
-        reader_type = FixedDurationEventReader if fixed_duration else FixedSizeEventReader
+        is_raw_file = False
     else:
         raise ValueError('Unsupported event file extension: {} (expected one of: {})'.format(
             file_extension, ', '.join(RAW_EXTENSIONS + TXT_EXTENSIONS)))
 
+    if frame_timestamps_ns is not None:
+        reader_type = TimestampedEvt3EventReader if is_raw_file else TimestampedEventReader
+        return reader_type(path_to_event_file, frame_timestamps_ns,
+                           start_index=start_index, t_offset=t_offset)
+
     if fixed_duration:
+        reader_type = FixedDurationEvt3EventReader if is_raw_file else FixedDurationEventReader
         return reader_type(path_to_event_file, duration_ms=window_duration_ms,
                            start_index=start_index, t_offset=t_offset)
 
+    reader_type = FixedSizeEvt3EventReader if is_raw_file else FixedSizeEventReader
     return reader_type(path_to_event_file, num_events=num_events,
                        start_index=start_index, t_offset=t_offset)

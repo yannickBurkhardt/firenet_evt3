@@ -148,6 +148,8 @@ Below is a description of the most important parameters:
 - ``--window_size`` / ``-N`` (default: None) Number of events per window. This is the parameter that has the most influence of the image reconstruction quality. If set to None, this number will be automatically computed based on the sensor size, as N = width * height * num_events_per_pixel (see description of that parameter below). Ignored if `--fixed_duration` is set.
 - ``--fixed_duration`` (default: False) If True, will use windows of events with a fixed duration (i.e. a fixed output frame rate).
 - ``--window_duration`` / ``-T`` (default: 33 ms) Duration of each event window, in milliseconds. The value of this parameter has strong influence on the image reconstruction quality. Its value may need to be adapted to the dynamics of the scene. Ignored if `--fixed_duration` is not set. Windows are cut on the absolute time grid anchored at t = 0, i.e. window k contains the events whose timestamp falls in [k * T, (k + 1) * T), so that the window boundaries do not depend on when the recording happens to start. Windows without any event produce no output frame.
+- ``--timestamps_file`` (default: None) Path to a file of frame timestamps, one per line: the events are then cut at those times instead of on the grid of `--fixed_duration` / `-N`, and one frame is reconstructed per timestamp. The frame of timestamp `t[k]` is built from the events of `(t[k-1], t[k]]`; the first one covers one frame period before `t[0]`, i.e. `(t[0] - (t[1] - t[0]), t[0]]`, and the events before that belong to no frame. A timestamp that gets no event at all produces no frame. Cannot be combined with `--fixed_duration`. See below.
+- ``--timestamps_unit`` (default: 'ns') Unit of the timestamps of `--timestamps_file`: `ns`, `us` or `s`. They are read as exact integers, not as floats, and are on the time base of the events, i.e. absolute for a recording whose header declares a time origin.
 - ``--width``, ``--height`` (default: None) Sensor size. Overrides the value read from the event file, and required for `.raw` files whose header does not specify a geometry. Must be given together.
 - ``--t_offset`` (default: the time origin declared in the header of a `.raw` file, 0.0 without one) Offset in seconds added to every event timestamp, to bring several recordings into a common time frame (e.g. to compensate a known delay between the two cameras of a stereo rig, or to stamp them with absolute time). It shifts both the output timestamps and the window boundaries. Given explicitly, it replaces the `% t_offset_us` value of the header rather than adding to it.
 - ``--Imin`` (default: 0.0), `--Imax` (default: 1.0): linear tone mapping is performed by normalizing the output image as follows: `I = (I - Imin) / (Imax - Imin)`. If `--auto_hdr` is set to True, `--Imin` and `--Imax` will be automatically computed as the min (resp. max) intensity values.
@@ -189,6 +191,29 @@ Notes:
   (`% t_offset_us`) and are stamped with absolute time without any extra flag. Otherwise, use
   `--t_offset` to move the recordings of the two cameras into a common time frame; a negative
   resulting timestamp is refused, since it cannot be expressed as a file name.
+
+#### Reconstructing at the timestamps of another camera
+
+`--timestamps_file` puts the frames on the clock of another sensor instead of on a window grid,
+which is what makes an event camera and a frame camera directly comparable: give it the capture
+times of the other camera and every reconstruction is the state of the scene at the instant that
+camera took its image.
+
+```bash
+python run_reconstruction.py -c pretrained/firenet_1000.pth.tar \
+  -i /path/to/cam0.raw --timestamps_file /path/to/zed_timestamps.txt --auto_hdr \
+  -o /path/to/dataset-dir/cam0
+```
+
+The file holds one timestamp per line, in nanoseconds unless `--timestamps_unit` says otherwise;
+blank lines and `#` comments are ignored. Timestamps that do not lie after the one before them are
+reported and skipped, as they would ask for a frame covering no events.
+
+Both time bases have to be the same one: a `.raw` that carries `% t_offset_us` is stamped with
+absolute time by itself, so the timestamps are then absolute too (19 digits in nanoseconds). Such a
+timestamp does not fit a float, so it is carried as an integer all the way to the file name of the
+image, which is exactly the timestamp that was asked for -- the frames of the event camera and the
+images of the other camera end up on the very same timestamps.
 
 #### Display parameters
 
